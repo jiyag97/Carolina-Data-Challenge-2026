@@ -1,6 +1,6 @@
 ---
 title: "Can You Fix It? School Stress Intervention Calculator"
-author: "Lucy Liu"
+author: "Jiya Gupta, Lucy Liu, Kaya Li, Lily Foo"
 date: "2026-09-26"
 output: html_document
 runtime: shiny
