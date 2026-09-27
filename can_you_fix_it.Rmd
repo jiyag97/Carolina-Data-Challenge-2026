@@ -1,0 +1,549 @@
+---
+title: "Can You Fix It? School Stress Intervention Calculator"
+author: "Lucy Liu"
+date: "2026-09-26"
+output: html_document
+runtime: shiny
+---
+
+```{r}
+# run this line ONCE then restart RStudio
+#census_api_key("c20ace7b4533d242ddf3dda619ab030b267bfd8b", install = TRUE, overwrite = TRUE)
+```
+
+
+```{r setup, include=FALSE}
+# Step 1: Load packages and data
+library(tidyverse)
+library(tidycensus)
+library(shiny)
+
+df <- read_csv("data/index_scores_v3_2026.csv") |>
+  rename(
+    composite     = `Composite Score`,
+    school_name   = Name,
+    state         = State,
+    city          = City,
+    park_access   = `Park access`,
+    broadband     = `Access to broadband internet`,
+    healthcare    = `Access to healthcare`,
+    violent_crime = `Violent crime rate`,
+    snap          = `SNAP recipients`,
+    housing_aff   = `Housing affordability`,
+    poverty       = Poverty
+  )
+
+county_pop <- get_acs(
+  geography = "county",
+  variables = "B01003_001",
+  year      = 2023
+) |>
+  rename(fips = GEOID, population = estimate) |>
+  select(fips, population)
+
+df <- df |>
+  mutate(
+    fips = str_pad(`FIPS County Code`, width = 5, pad = "0"),
+    across(c(broadband, healthcare, park_access, violent_crime, snap,
+             composite, poverty, housing_aff),
+           ~ as.numeric(ifelse(. == "N/A", NA, .)))
+  ) |>
+  left_join(county_pop, by = "fips")
+
+my_school <- df |>
+  filter(state == "NC", city == "Fayetteville") |>
+  slice(1)
+
+cat("County population:", format(my_school$population, big.mark=","), "\n")
+```
+
+```{r}
+# ── eligibility check ─────────────────────────
+eligible <- list(
+  park_access   = as.numeric(my_school$park_access)   > 4,   # above target
+  broadband     = as.numeric(my_school$broadband)     > 9,   # above national
+  healthcare    = as.numeric(my_school$healthcare)    > 2,   # above national 
+  violent_crime = as.numeric(my_school$violent_crime) > 8,   # above national 
+  snap          = as.numeric(my_school$poverty)       > 31 &
+                  as.numeric(my_school$snap)          > 30    # above national 
+)
+
+cat("=== ELIGIBILITY CHECK ===\n")
+for (nm in names(eligible)) {
+  cat(sprintf("  %-20s %s\n", nm, ifelse(eligible[[nm]], "✓ eligible", "✗ skip")))
+}
+
+# ── population multiplier ─────────────────────
+nat_median_pop <- 85000   # median county population that has high schools
+pop_multiplier <- sqrt(as.numeric(my_school$population) / nat_median_pop)
+pop_multiplier <- max(0.5, min(pop_multiplier, 3.0))
+
+# ── RPP adjustment (BEA 2022) ─────────────────
+rpp_table <- c(
+  AL=87.5, AK=104.9, AZ=96.5, AR=86.0, CA=113.4, CO=101.9, CT=108.1,
+  DE=101.3, FL=100.7, GA=91.9, HI=111.0, ID=93.4, IL=96.3, IN=89.5,
+  IA=90.5, KS=89.8, KY=87.8, LA=91.0, ME=96.1, MD=108.3, MA=111.1,
+  MI=91.7, MN=98.0, MS=83.3, MO=89.8, MT=94.0, NE=91.0, NV=98.3,
+  NH=106.0, NJ=109.0, NM=91.5, NY=108.1, NC=93.8, ND=94.3, OH=90.3,
+  OK=87.5, OR=101.5, PA=96.7, RI=106.2, SC=91.7, SD=91.4, TN=89.4,
+  TX=95.0, UT=96.7, VT=105.8, VA=100.8, WA=105.3, WV=83.8, WI=94.3,
+  WY=95.7, DC=121.2, PR=100.0
+)
+rpp_factor    <- rpp_table[my_school$state] / 100
+pop_multiplier <- pop_multiplier * rpp_factor   # combined multiplier
+cat(sprintf("\nCombined multiplier: %.4fx (pop_factor=%.4f, RPP=%.1f)\n",
+            pop_multiplier, pop_multiplier / rpp_factor, rpp_table[my_school$state]))
+
+# ── adjusted costs ────────────────────────────
+base_costs <- list(
+  park_access = 400000, broadband = 120000,
+  healthcare  = 320000, violent_crime = 90000, snap = 700000
+)
+adj_costs <- lapply(base_costs, function(x) x * pop_multiplier)
+
+# ── optimizer ─────────────────────────────────
+target_reduction <- 5
+max_contribution <- target_reduction * 0.40
+
+current <- list(
+  park_access   = as.numeric(my_school$park_access),
+  broadband     = as.numeric(my_school$broadband),
+  healthcare    = as.numeric(my_school$healthcare),
+  violent_crime = as.numeric(my_school$violent_crime),
+  snap          = as.numeric(my_school$snap)
+)
+current   <- lapply(current, function(x) ifelse(is.na(x), 50, x))
+
+# PCT_TARGETS: 10th percentile of stress score = 90th pct performance nationally
+pct_targets <- list(park_access=4, broadband=9, healthcare=2, violent_crime=8, snap=31)
+
+max_improve <- list(
+  park_access   = max(0, current$park_access   - pct_targets$park_access),
+  broadband     = max(0, current$broadband     - pct_targets$broadband),
+  healthcare    = max(0, current$healthcare    - pct_targets$healthcare),
+  violent_crime = max(0, current$violent_crime - pct_targets$violent_crime),
+  snap          = max(0, current$snap          - pct_targets$snap)
+)
+
+K <- 100 / (63 - 9)   # ODIS rescaling factor
+coefs <- list(
+  park_access   = (1/15) * K,   # 1/5 domain * 1/3 indicator
+  broadband     = 0.05   * K,   # 1/5 domain * 1/4 indicator
+  healthcare    = 0.04   * K,   # 1/5 domain * 1/5 indicator
+  violent_crime = 0.10   * K,   # 1/5 domain * 1/2 indicator
+  snap          = 0.04   * K    # 1/5 domain * 1/5 indicator
+)
+
+efficiency <- data.frame(
+  intervention = names(coefs),
+  coef         = unlist(coefs),
+  cost_per_pt  = unlist(adj_costs),
+  max_improve  = unlist(max_improve)
+) |>
+  mutate(
+    eligible = c(
+      eligible$park_access,
+      eligible$broadband,
+      eligible$healthcare,
+      eligible$violent_crime,
+      eligible$snap
+    ),
+    efficiency       = coef / cost_per_pt,
+    max_stress_reduc = coef * max_improve
+  ) |>
+  filter(eligible == TRUE) |>
+  arrange(desc(efficiency))
+
+remaining  <- target_reduction
+total_cost <- 0
+plan       <- data.frame()
+
+for (i in 1:nrow(efficiency)) {
+  if (remaining <= 0) break
+  row        <- efficiency[i, ]
+  use_reduc  <- min(remaining, row$max_stress_reduc, max_contribution)
+  pts_needed <- use_reduc / row$coef
+  cost       <- pts_needed * row$cost_per_pt
+
+  plan <- rbind(plan, data.frame(
+    intervention     = row$intervention,
+    improve_by       = round(pts_needed, 1),
+    stress_reduction = round(use_reduc, 2),
+    cost             = round(cost)
+  ))
+
+  remaining  <- remaining - use_reduc
+  total_cost <- total_cost + cost
+}
+
+# ── results ───────────────────────────────────
+cat("\n=== OPTIMAL PLAN: reduce stress by", target_reduction, "points ===\n")
+cat(sprintf("Costs adjusted for Cumberland County (%.2fx multiplier)\n\n", pop_multiplier))
+for (i in 1:nrow(plan)) {
+  cat(sprintf("  %-20s +%4.1f pts  →  -%.2f stress  |  $%s\n",
+    plan$intervention[i],
+    plan$improve_by[i],
+    plan$stress_reduction[i],
+    format(plan$cost[i], big.mark=",")))
+}
+cat(sprintf("\n  TOTAL COST:    $%s\n", format(round(total_cost), big.mark=",")))
+cat(sprintf("  Original score: %.1f  →  New score: %.1f\n",
+    my_school$composite, my_school$composite - target_reduction))
+```
+
+
+```{r}
+shinyApp(
+  ui = fluidPage(
+    h3("Can You Fix It? School Stress Intervention Calculator"),
+
+    fluidRow(
+      column(6,
+        selectInput("state_sel", "Select State:",
+                    choices  = sort(unique(df$state)),
+                    selected = "NC")
+      ),
+      column(6,
+        selectInput("school_sel", "Select School:", choices = NULL)
+      )
+    ),
+
+    hr(),
+    h4("Current School Profile"),
+    tableOutput("profile_table"),
+
+    hr(),
+    h4("Recommended Optimal Plan"),
+    p("This is the cheapest combination of interventions to reduce stress by your target."),
+    fluidRow(
+      column(4,
+        numericInput("target", "Target stress reduction (points):",
+                     value = 5, min = 1, max = 20, step = 1)
+      )
+    ),
+    tableOutput("optimizer_table"),
+    verbatimTextOutput("optimizer_summary"),
+
+    hr(),
+    uiOutput("explanation_text"),
+    br(),
+
+    h4("Customize Your Own Plan"),
+    p("Type a value or use the +/- arrows. Maximum is capped at what is realistically achievable."),
+
+    fluidRow(
+      column(3,
+        numericInput("s_broadband",  "Broadband improvement (pts)",     value=0, min=0, step=1),
+        textOutput("cap_broadband"),
+        br(),
+        numericInput("s_healthcare", "Healthcare improvement (pts)",    value=0, min=0, step=1),
+        textOutput("cap_healthcare"),
+        br(),
+        numericInput("s_crime",      "Crime reduction (pts)",           value=0, min=0, step=1),
+        textOutput("cap_crime"),
+        br(),
+        numericInput("s_snap",       "SNAP outreach improvement (pts)", value=0, min=0, step=1),
+        textOutput("cap_snap"),
+        br(),
+        numericInput("s_park",       "Park access improvement (pts)",   value=0, min=0, step=1),
+        textOutput("cap_park")
+      ),
+      column(9,
+        h5("Cost & Impact Breakdown"),
+        tableOutput("manual_table"),
+        br(),
+        verbatimTextOutput("manual_summary")
+      )
+    )
+  ),
+
+  server = function(input, output, session) {
+
+    # Dynamic school dropdown
+    observeEvent(input$state_sel, {
+      schools_in_state <- df |>
+        filter(state == input$state_sel) |>
+        pull(school_name) |>
+        sort() |>
+        unique()
+      updateSelectInput(session, "school_sel", choices = schools_in_state)
+    })
+
+    # Selected school reactive
+    selected_school <- reactive({
+      req(input$school_sel)
+      df |>
+        filter(state == input$state_sel, school_name == input$school_sel) |>
+        slice(1) |>
+        left_join(county_pop, by = "fips")
+    })
+
+    # Caps and multiplier reactive
+    school_meta <- reactive({
+      s  <- selected_school()
+      rpp_table <- c(
+        AL=87.5, AK=104.9, AZ=96.5, AR=86.0, CA=113.4, CO=101.9, CT=108.1,
+        DE=101.3, FL=100.7, GA=91.9, HI=111.0, ID=93.4, IL=96.3, IN=89.5,
+        IA=90.5, KS=89.8, KY=87.8, LA=91.0, ME=96.1, MD=108.3, MA=111.1,
+        MI=91.7, MN=98.0, MS=83.3, MO=89.8, MT=94.0, NE=91.0, NV=98.3,
+        NH=106.0, NJ=109.0, NM=91.5, NY=108.1, NC=93.8, ND=94.3, OH=90.3,
+        OK=87.5, OR=101.5, PA=96.7, RI=106.2, SC=91.7, SD=91.4, TN=89.4,
+        TX=95.0, UT=96.7, VT=105.8, VA=100.8, WA=105.3, WV=83.8, WI=94.3,
+        WY=95.7, DC=121.2, PR=100.0
+      )
+      rpp <- rpp_table[s$state] / 100
+      pm  <- sqrt(as.numeric(s$population) / 85000)
+      pm  <- max(0.5, min(pm, 3.0)) * rpp
+      list(
+        pop_multiplier = pm,
+        caps = list(
+          broadband  = max(0, round(as.numeric(s$broadband)     -  9)),
+          healthcare = max(0, round(as.numeric(s$healthcare)    -  2)),
+          crime      = max(0, round(as.numeric(s$violent_crime) -  8)),
+          snap       = max(0, round(as.numeric(s$snap)          - 31)),
+          park       = max(0, round(as.numeric(s$park_access)   -  4))
+        ),
+        eligible = list(
+          broadband  = !is.na(s$broadband)     && as.numeric(s$broadband)     > 20,
+          healthcare = !is.na(s$healthcare)    && as.numeric(s$healthcare)    >  5,
+          crime      = !is.na(s$violent_crime) && as.numeric(s$violent_crime) > 30,
+          snap       = !is.na(s$poverty)       && as.numeric(s$poverty)       > 30 &&
+                       !is.na(s$snap)          && as.numeric(s$snap)          > 47,
+          park       = !is.na(s$park_access)   && as.numeric(s$park_access)   > 40
+        )
+      )
+    })
+
+    # Reset inputs when school changes
+    observeEvent(school_meta(), {
+      caps <- school_meta()$caps
+      updateNumericInput(session, "s_broadband",  max = caps$broadband,  value = 0)
+      updateNumericInput(session, "s_healthcare", max = caps$healthcare, value = 0)
+      updateNumericInput(session, "s_crime",      max = caps$crime,      value = 0)
+      updateNumericInput(session, "s_snap",       max = caps$snap,       value = 0)
+      updateNumericInput(session, "s_park",       max = caps$park,       value = 0)
+    })
+
+    # Profile table
+    output$profile_table <- renderTable({
+      s <- selected_school()
+      data.frame(
+        Indicator = c("Composite Stress", "Park Access", "Broadband",
+                      "Healthcare", "Violent Crime", "SNAP Recipients", "Poverty"),
+        Current.Value = c(
+          round(as.numeric(s$composite), 1),
+          round(as.numeric(s$park_access), 1),
+          round(as.numeric(s$broadband), 1),
+          round(as.numeric(s$healthcare), 1),
+          round(as.numeric(s$violent_crime), 1),
+          round(as.numeric(s$snap), 1),
+          round(as.numeric(s$poverty), 1)
+        ),
+        National.Percentile = c(
+          NA,
+          round(mean(df$park_access   <= as.numeric(s$park_access),   na.rm=TRUE)*100),
+          round(mean(df$broadband     <= as.numeric(s$broadband),     na.rm=TRUE)*100),
+          round(mean(df$healthcare    <= as.numeric(s$healthcare),    na.rm=TRUE)*100),
+          round(mean(df$violent_crime <= as.numeric(s$violent_crime), na.rm=TRUE)*100),
+          round(mean(df$snap          <= as.numeric(s$snap),          na.rm=TRUE)*100),
+          round(mean(df$poverty       <= as.numeric(s$poverty),       na.rm=TRUE)*100)
+        )
+      )
+    })
+
+    # Optimizer
+    optimizer_plan <- reactive({
+      s    <- selected_school()
+      meta <- school_meta()
+      pm   <- meta$pop_multiplier
+      elig <- meta$eligible
+      caps <- meta$caps
+
+
+      K_shiny   <- 100 / (63 - 9)
+      coefs     <- c(broadband  = 0.05   * K_shiny,
+                     healthcare = 0.04   * K_shiny,
+                     crime      = 0.10   * K_shiny,
+                     snap       = 0.04   * K_shiny,
+                     park       = (1/15) * K_shiny)
+      base_cost <- c(broadband=120000, healthcare=320000,
+                     crime=90000,      snap=700000, park=400000)
+      max_imp   <- c(broadband  = caps$broadband,
+                     healthcare = caps$healthcare,
+                     crime      = caps$crime,
+                     snap       = caps$snap,
+                     park       = caps$park)
+      eligible_vec <- c(broadband  = elig$broadband,
+                        healthcare = elig$healthcare,
+                        crime      = elig$crime,
+                        snap       = elig$snap,
+                        park       = elig$park)
+
+      eff <- data.frame(
+        intervention = names(coefs),
+        coef         = coefs,
+        cost_per_pt  = base_cost * pm,
+        max_improve  = max_imp,
+        eligible     = eligible_vec
+      ) |>
+        filter(eligible == TRUE) |>
+        mutate(
+          efficiency       = coef / cost_per_pt,
+          max_stress_reduc = coef * max_improve
+        ) |>
+        arrange(desc(efficiency))
+
+      target           <- input$target
+      max_contribution <- target * 0.40
+      remaining        <- target
+      total_cost       <- 0
+      plan             <- data.frame()
+
+      for (i in seq_len(nrow(eff))) {
+        if (remaining <= 0) break
+        row        <- eff[i, ]
+        use_reduc  <- min(remaining, row$max_stress_reduc, max_contribution)
+        pts_needed <- use_reduc / row$coef
+        cost       <- pts_needed * row$cost_per_pt
+        plan <- rbind(plan, data.frame(
+          Intervention     = row$intervention,
+          Improve.by       = round(pts_needed, 1),
+          Stress.reduced   = round(use_reduc, 2),
+          Cost             = format(round(cost), big.mark = ",")
+        ))
+        remaining  <- remaining - use_reduc
+        total_cost <- total_cost + cost
+      }
+
+      list(plan = plan, total_cost = total_cost)
+    })
+
+    output$optimizer_table <- renderTable({ optimizer_plan()$plan })
+
+    output$optimizer_summary <- renderText({
+      s         <- selected_school()
+      result    <- optimizer_plan()
+      new_score <- as.numeric(s$composite) - input$target
+      paste0(
+        "Total cost:      $", format(round(result$total_cost), big.mark=","), "\n",
+        "Original score:   ", round(as.numeric(s$composite), 1), "\n",
+        "New score:        ", round(new_score, 1), "\n",
+        "Pop. multiplier:  ", round(school_meta()$pop_multiplier, 2), "x"
+      )
+    })
+
+    # Explanation paragraph
+    output$explanation_text <- renderUI({
+      s    <- selected_school()
+      meta <- school_meta()
+      caps <- meta$caps
+      elig <- meta$eligible
+
+      skipped <- c()
+      if (!elig$park)
+        skipped <- c(skipped, paste0("park access (already at ",
+                     round(as.numeric(s$park_access)), ")"))
+      if (!elig$broadband)
+        skipped <- c(skipped, paste0("broadband (already at ",
+                     round(as.numeric(s$broadband)), ")"))
+      if (!elig$snap)
+        skipped <- c(skipped, paste0("SNAP (poverty rate ",
+                     round(as.numeric(s$poverty)),
+                     "% is below the 30% eligibility threshold)"))
+
+      skipped_text <- if (length(skipped) > 0) {
+        paste0("Note: ", paste(skipped, collapse = " and "),
+               " are not recommended for this school — the gap is too small ",
+               "to justify investment. You can still enter values below, ",
+               "but they will be capped and costs may not reflect realistic returns.")
+      } else {
+        "All interventions are eligible for this school."
+      }
+
+      tags$div(
+        tags$p(paste0(
+          "Each input below is capped at the maximum realistic improvement for ",
+          input$school_sel, ". Broadband can improve by at most ",
+          round(caps$broadband), " points, and crime can be reduced by at most ",
+          round(caps$crime), " points. Costs are adjusted by a ",
+          round(meta$pop_multiplier, 2), "x population multiplier based on ",
+          format(round(as.numeric(s$population), -3), big.mark=","),
+          " residents in this county."
+        )),
+        tags$p(skipped_text, style = "color: #888; font-style: italic;")
+      )
+    })
+
+    # Cap warning labels
+    make_cap_text <- function(val_reactive, cap_name, elig_name) {
+      renderText({
+        meta <- school_meta()
+        cap  <- meta$caps[[cap_name]]
+        elig <- meta$eligible[[elig_name]]
+        val  <- as.numeric(val_reactive())
+        if (!elig) {
+          paste0("Max: ", round(cap), " pts (not recommended — see note above)")
+        } else if (!is.na(val) && val > cap) {
+          paste0("⚠ Capped at ", round(cap), " pts max")
+        } else {
+          paste0("Max: ", round(cap), " pts")
+        }
+      })
+    }
+
+    output$cap_broadband  <- make_cap_text(reactive(input$s_broadband),  "broadband",  "broadband")
+    output$cap_healthcare <- make_cap_text(reactive(input$s_healthcare), "healthcare", "healthcare")
+    output$cap_crime      <- make_cap_text(reactive(input$s_crime),      "crime",      "crime")
+    output$cap_snap       <- make_cap_text(reactive(input$s_snap),       "snap",       "snap")
+    output$cap_park       <- make_cap_text(reactive(input$s_park),       "park",       "park")
+
+    # Manual calculator
+    manual_result <- reactive({
+      pm   <- school_meta()$pop_multiplier
+      caps <- school_meta()$caps
+
+      b  <- min(max(0, input$s_broadband),  caps$broadband)
+      h  <- min(max(0, input$s_healthcare), caps$healthcare)
+      cr <- min(max(0, input$s_crime),      caps$crime)
+      sn <- min(max(0, input$s_snap),       caps$snap)
+      pk <- min(max(0, input$s_park),       caps$park)
+
+      data.frame(
+        Intervention   = c("Broadband","Healthcare","Crime","SNAP","Park access"),
+        Points         = c(b, h, cr, sn, pk),
+        Stress.Reduced = round(c(b*(0.05*100/54), h*(0.04*100/54), cr*(0.10*100/54), sn*(0.04*100/54), pk*((1/15)*100/54)), 2),
+        Cost           = format(round(c(
+          b*120000*pm, h*320000*pm, cr*90000*pm, sn*700000*pm, pk*400000*pm
+        )), big.mark = ",")
+      ) |>
+        filter(Points > 0)
+    })
+
+    output$manual_table <- renderTable({ manual_result() })
+
+    output$manual_summary <- renderText({
+      s    <- selected_school()
+      pm   <- school_meta()$pop_multiplier
+      caps <- school_meta()$caps
+
+      b  <- min(max(0, input$s_broadband),  caps$broadband)
+      h  <- min(max(0, input$s_healthcare), caps$healthcare)
+      cr <- min(max(0, input$s_crime),      caps$crime)
+      sn <- min(max(0, input$s_snap),       caps$snap)
+      pk <- min(max(0, input$s_park),       caps$park)
+
+      stress_change <- b*(0.05*100/54) + h*(0.04*100/54) + cr*(0.10*100/54) + sn*(0.04*100/54) + pk*((1/15)*100/54)
+      total_cost    <- (b*120000 + h*320000 + cr*90000 + sn*700000 + pk*400000) * pm
+      new_score     <- as.numeric(s$composite) - stress_change
+
+      paste0(
+        "Total stress reduction:  ", round(stress_change, 1), " points\n",
+        "New stress score:        ", round(new_score, 1), "\n",
+        "Total estimated cost:    $", format(round(total_cost), big.mark=",")
+      )
+    })
+  },
+
+  options = list(height = 1000)
+)
+```
