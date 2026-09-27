@@ -19,10 +19,6 @@ The calculator uses ODIS school-level data for 23,599 U.S. high schools. It also
 
 ODIS combines five domains with equal weight. Within each domain, indicators are averaged. The calculator follows those published weights to estimate how changing an indicator changes the composite score, then applies ODIS’s 0–100 display scale. The modeled change to the index is therefore formula-based; it does **not** establish that an intervention will cause a particular change in student stress.
 
-### Eligibility and improvement limits
-
-A lever is recommended when a school’s indicator is above the model’s target. The current targets are park access 4, broadband 9, healthcare 2, violent crime 8, and SNAP 31. SNAP also requires a poverty score above 30. The calculator limits improvement to the gap between the school’s current value and the target.
-
 ### Cost estimates
 
 Base estimates are applied per indicator point and adjusted for local population and prices:
